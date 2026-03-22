@@ -17,76 +17,114 @@ def custom_assign_speakers(transcript_result, diarize_df):
         
         # 1. TÌM SPEAKER CHO TOÀN BỘ CÂU (SEGMENT)
         # Duyệt qua các kết quả diarization (thường là pandas DataFrame)
-        for _, row in diarize_df.iterrows():
-            spk_start = row['start']
-            spk_end = row['end']
-            speaker_label = row['speaker']
-            
-            # Tính toán khoảng thời gian giao nhau thực tế
-            overlap_start = max(seg_start, spk_start)
-            overlap_end = min(seg_end, spk_end)
-            overlap_duration = overlap_end - overlap_start
-            
-            # Nếu có giao thoa (thời gian kết thúc > thời gian bắt đầu)
-            if overlap_duration > 0:
-                if speaker_label not in speaker_overlaps:
-                    speaker_overlaps[speaker_label] = 0
-                speaker_overlaps[speaker_label] += overlap_duration
-        
-        # Gán nhãn cho người có thời gian giao thoa dài nhất
-        if speaker_overlaps:
-            best_speaker = max(speaker_overlaps, key=speaker_overlaps.get)
-            segment["speaker"] = best_speaker
-            
-            # Tính năng nâng cao: Đánh dấu nếu có người nói chen vào (chiếm > 20% thời gian câu)
-            total_overlap = sum(speaker_overlaps.values())
-            for spk, duration in speaker_overlaps.items():
-                if spk != best_speaker and (duration / total_overlap) > 0.2:
-                    segment["overlap_warning"] = True # Cảnh báo: Có người nói chồng
-        else:
-            segment["speaker"] = "UNKNOWN"
-
-        # 2. TÌM SPEAKER CHÍNH XÁC CHO TỪNG TỪ (WORD-LEVEL)
-        # Chỉ chạy nếu bạn đã dùng hàm whisperx.align() trước đó
-        if "words" in segment:
-            for word in segment["words"]:
-                # Có những từ Whisper không bắt được timestamp chính xác
-                if "start" in word and "end" in word:
-                    w_start = word["start"]
-                    w_end = word["end"]
-                    w_overlaps = {}
-                    
-                    for _, row in diarize_df.iterrows():
-                        overlap_start = max(w_start, row['start'])
-                        overlap_end = min(w_end, row['end'])
-                        duration = overlap_end - overlap_start
-                        
-                        if duration > 0:
-                            if row['speaker'] not in w_overlaps:
-                                w_overlaps[row['speaker']] = 0
-                            w_overlaps[row['speaker']] += duration
-                    
-                    # Gán người nói cho từ
-                    if w_overlaps:
-                        word["speaker"] = max(w_overlaps, key=w_overlaps.get)
-                    else:
-                        word["speaker"] = segment["speaker"] # Nếu không tìm thấy, lấy speaker của cả câu
-
-    return transcript_result
+        import pandas as pd
 
 
+        def custom_assign_speakers(transcript_result, diarize_df, overlap_warn_threshold=0.2):
+            """
+            Gán speaker cho segment và trên cấp từ dựa trên thời gian giao thoa.
 
-# Sử dụng hàm custom để gộp kết quả
-    result = custom_assign_speakers(result, diarize_segments)
+            - transcript_result: dict với key "segments" (mỗi segment có 'start','end','text' và optional 'words')
+            - diarize_df: pandas.DataFrame với cột 'start','end','speaker'
+            - overlap_warn_threshold: ngưỡng (0-1) để đánh dấu cảnh báo overlap
+            """
+            required_cols = {"start", "end", "speaker"}
+            if not required_cols.issubset(set(diarize_df.columns)):
+                raise ValueError(f"diarize_df phải có cột: {required_cols}")
 
-    # --- In kết quả xem thử có bắt được đoạn Overlap không ---
-    print("\n--- KẾT QUẢ ---")
-    for segment in result["segments"]:
-        speaker = segment.get("speaker", "UNKNOWN")
-        text = segment['text']
-        
-        # Nếu có người nói chồng, in thêm cảnh báo
-        if segment.get("overlap_warning"):
-            print(f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {speaker} (⚠️ Có tiếng chèn): {text}")
-        else:
-            print(f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {speaker}: {text}")
+            for segment in transcript_result.get("segments", []):
+                seg_start = segment.get("start", 0.0)
+                seg_end = segment.get("end", 0.0)
+
+                # Lọc nhanh các interval diarization có khả năng giao thoa với segment
+                mask = (diarize_df['end'] > seg_start) & (diarize_df['start'] < seg_end)
+                candidates = diarize_df.loc[mask]
+
+                speaker_overlaps = {}
+                for _, row in candidates.iterrows():
+                    overlap_start = max(seg_start, row['start'])
+                    overlap_end = min(seg_end, row['end'])
+                    overlap_duration = overlap_end - overlap_start
+                    if overlap_duration > 0:
+                        speaker_overlaps[row['speaker']] = speaker_overlaps.get(row['speaker'], 0.0) + overlap_duration
+
+                if speaker_overlaps:
+                    best_speaker = max(speaker_overlaps, key=speaker_overlaps.get)
+                    segment["speaker"] = best_speaker
+
+                    total_overlap = sum(speaker_overlaps.values())
+                    for spk, dur in speaker_overlaps.items():
+                        if spk != best_speaker and (dur / total_overlap) > overlap_warn_threshold:
+                            segment["overlap_warning"] = True
+                            break
+                else:
+                    segment["speaker"] = "UNKNOWN"
+
+                # Word-level assignment (nếu có)
+                if "words" in segment and isinstance(segment["words"], list):
+                    for word in segment["words"]:
+                        if "start" in word and "end" in word:
+                            w_start = word["start"]
+                            w_end = word["end"]
+
+                            w_mask = (diarize_df['end'] > w_start) & (diarize_df['start'] < w_end)
+                            w_cands = diarize_df.loc[w_mask]
+                            w_overlaps = {}
+                            for _, row in w_cands.iterrows():
+                                o_start = max(w_start, row['start'])
+                                o_end = min(w_end, row['end'])
+                                dur = o_end - o_start
+                                if dur > 0:
+                                    w_overlaps[row['speaker']] = w_overlaps.get(row['speaker'], 0.0) + dur
+
+                            if w_overlaps:
+                                word["speaker"] = max(w_overlaps, key=w_overlaps.get)
+                            else:
+                                word["speaker"] = segment.get("speaker", "UNKNOWN")
+
+            return transcript_result
+
+
+        if __name__ == "__main__":
+            # Ví dụ mẫu để kiểm thử nhanh
+            sample_result = {
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 2.5,
+                        "text": "Hello there",
+                        "words": [
+                            {"start": 0.0, "end": 0.5, "text": "Hello"},
+                            {"start": 0.6, "end": 1.0, "text": "there"}
+                        ]
+                    },
+                    {
+                        "start": 2.5,
+                        "end": 5.0,
+                        "text": "How are you",
+                        "words": [
+                            {"start": 2.6, "end": 3.0, "text": "How"},
+                            {"start": 3.1, "end": 4.5, "text": "are you"}
+                        ]
+                    }
+                ]
+            }
+
+            diarize_segments = pd.DataFrame([
+                {"start": 0.0, "end": 1.0, "speaker": "spk0"},
+                {"start": 0.9, "end": 3.0, "speaker": "spk1"},
+                {"start": 3.0, "end": 5.0, "speaker": "spk0"},
+            ])
+
+            merged = custom_assign_speakers(sample_result, diarize_segments)
+
+            print("\n--- KẾT QUẢ ---")
+            for seg in merged["segments"]:
+                sp = seg.get("speaker", "UNKNOWN")
+                txt = seg.get("text", "")
+                if seg.get("overlap_warning"):
+                    print(f"[{seg['start']:.2f}s - {seg['end']:.2f}s] {sp} (⚠️ overlap): {txt}")
+                else:
+                    print(f"[{seg['start']:.2f}s - {seg['end']:.2f}s] {sp}: {txt}")
+                for w in seg.get("words", []):
+                    print(f"  - {w.get('text','')} ({w.get('start')}-{w.get('end')}) -> {w.get('speaker')}")
